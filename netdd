@@ -1,0 +1,834 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# ============================================================
+# OS.Dog v3 — Network Disk Deploy (netdd)
+# Installs OS.Dog v3 image onto a mining rig's boot disk.
+# Works on any Linux: OS.Dog v3/v1, HiveOS, RaveOS, MMPOS, ethOS, Ubuntu, etc.
+#
+# One-liner:
+#   wget -qO /tmp/netdd https://os.dog/netdd && chmod +x /tmp/netdd && /tmp/netdd -y -l
+# ============================================================
+
+NETDD_VERSION="3.0"
+TMPDIR="/tmp/osdog"
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+
+# Prevent running from pipe
+[[ "$(basename "$0")" == "bash" || "$(basename "$0")" == "sh" ]] && { echo "netdd does not work from pipe!"; exit 1; }
+
+export PATH="/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:$PATH"
+
+# ============================================================
+# Colors
+# ============================================================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+PURPLE='\033[0;35m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+die()  { echo -e "${RED}[FATAL]${NC} $*" >&2; exit 1; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+info() { echo -e "${CYAN}[*]${NC} $*"; }
+ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
+
+# ============================================================
+# CLI options (globals)
+# ============================================================
+OPT_YES=""
+OPT_URL=""
+OPT_RIG_ID=""
+OPT_PASSWORD=""
+OPT_SERVER=""
+OPT_CONFIG=""
+OPT_SSHPASS=""
+
+# Runtime state
+CURRENT_OS="linux"
+DISK_NAME=""
+DISK_SIZE_MB=""
+IMAGE_URL=""
+IMAGE_FILE=""
+
+# ============================================================
+# Helpers
+# ============================================================
+fetch_url() {
+    local url="$1"
+    if command -v wget &>/dev/null; then
+        wget -qO- -T 20 "$url"
+    elif command -v curl &>/dev/null; then
+        curl -sLk --connect-timeout 20 "$url"
+    else
+        die "Neither wget nor curl available"
+    fi
+}
+
+disk_part() {
+    local disk="$1" num="$2"
+    if [[ "$disk" == nvme* || "$disk" == mmcblk* ]]; then
+        echo "${disk}p${num}"
+    else
+        echo "${disk}${num}"
+    fi
+}
+
+# ============================================================
+# show_banner
+# ============================================================
+show_banner() {
+    echo -e "${CYAN}"
+    cat <<'ART'
+ .d88888b.   .d8888b.           888
+d88P" "Y88b d88P  Y88b          888
+888     888 Y88b.               888
+888     888  "Y888b.        .d88888  .d88b.   .d88b.
+888     888     "Y88b.     d88" 888 d88""88b d88P"88b
+888     888       "888     888  888 888  888 888  888
+Y88b. .d88P Y88b  d88P d8b Y88b 888 Y88..88P Y88b 888
+ "Y88888P"   "Y8888P"  Y8P  "Y88888  "Y88P"   "Y88888
+                                                   888
+                                              Y8b d88P
+                                               "Y88P"
+ART
+    echo -e "${YELLOW}        Network Disk Deploy v${NETDD_VERSION}${NC}"
+    echo ""
+}
+
+# ============================================================
+# show_help
+# ============================================================
+show_help() {
+    echo -e "Usage: ${GREEN}netdd${NC} [options] ${BOLD}<image-url>${NC}"
+    echo ""
+    echo -e "Rig configuration:"
+    echo -e "  ${GREEN}    --rig-id N${NC}           Set rig ID"
+    echo -e "  ${GREEN}    --password STR${NC}       Set rig password"
+    echo -e "  ${GREEN}    --server URL${NC}         Set server URL (default: wss://os.dog)"
+    echo ""
+    echo -e "Download options:"
+    echo -e "  ${GREEN}    --sshpass STR${NC}        Password for SCP download"
+    echo ""
+    echo -e "General:"
+    echo -e "  ${GREEN}-y, --yes${NC}                Skip confirmation prompt"
+    echo -e "  ${GREEN}-h, --help${NC}               Show this help"
+    echo ""
+    echo -e "Examples:"
+    echo -e "  ${GREEN}netdd -y https://example.com/dog-v3-image-1.iso.xz${NC}"
+    echo -e "  ${GREEN}netdd -y --rig-id 42 --password secret https://example.com/dog-v3-image-1.iso.xz${NC}"
+    echo -e "  ${GREEN}netdd -y user@192.168.1.1:/path/dog-v3-image-1.iso.xz --sshpass mypass${NC}"
+}
+
+# ============================================================
+# detect_os — detect current running OS
+# ============================================================
+detect_os() {
+    if [[ -f /etc/osdog-release ]]; then
+        CURRENT_OS="osdog-v3"
+    elif [[ -f /dog/boot ]]; then
+        CURRENT_OS="osdog-v1"
+    elif [[ -f /opt/ethos/etc/version ]]; then
+        CURRENT_OS="ethos"
+    elif [[ -d /opt/mmp || -f /etc/mmp-release ]]; then
+        CURRENT_OS="mmpos"
+    elif [[ -f /hive-config/rig.conf ]]; then
+        CURRENT_OS="hiveos"
+    elif [[ -d /opt/raveos ]]; then
+        CURRENT_OS="raveos"
+    else
+        CURRENT_OS="linux"
+    fi
+    info "Detected OS: ${BOLD}${CURRENT_OS}${NC}"
+}
+
+# ============================================================
+# detect_disk — find boot disk
+# ============================================================
+detect_disk() {
+    local root_spec
+    root_spec=$(tr ' ' '\n' < /proc/cmdline | grep -E '^root=' | head -1 | sed 's/^root=//') || true
+
+    local root_part=""
+    if [[ "$root_spec" == UUID=* ]]; then
+        root_part=$(blkid -U "${root_spec#UUID=}" 2>/dev/null) || true
+    elif [[ "$root_spec" == LABEL=* ]]; then
+        root_part=$(blkid -L "${root_spec#LABEL=}" 2>/dev/null) || true
+    elif [[ "$root_spec" == /dev/* ]]; then
+        root_part="$root_spec"
+    fi
+
+    # Fallback: find root mount device
+    if [[ -z "$root_part" ]]; then
+        root_part=$(findmnt -n -o SOURCE / 2>/dev/null) || true
+    fi
+
+    [[ -z "$root_part" ]] && die "Cannot determine root partition"
+
+    # LVM is not supported (ref: mmp_rewrite.sh)
+    if [[ "$root_part" == /dev/mapper/* || "$root_part" == /dev/dm-* ]]; then
+        die "LVM detected on root filesystem. Reimage is not supported on LVM systems."
+    fi
+
+    root_part="${root_part#/dev/}"
+
+    # Strip partition suffix to get disk name
+    if [[ "$root_part" == nvme* || "$root_part" == mmcblk* ]]; then
+        DISK_NAME="${root_part%p[0-9]*}"
+    else
+        DISK_NAME=$(echo "$root_part" | sed 's/[0-9]*$//')
+    fi
+
+    DISK_SIZE_MB=$(awk -v disk="$DISK_NAME" '$4 == disk {printf "%.0f", $3/1024}' /proc/partitions)
+    [[ -z "$DISK_SIZE_MB" ]] && die "Cannot determine disk size for $DISK_NAME"
+    [[ "$DISK_SIZE_MB" -lt 7300 ]] && die "Disk ${DISK_NAME} is ${DISK_SIZE_MB} MB. Minimum 8 GB required."
+
+    info "Boot disk: ${BOLD}/dev/${DISK_NAME}${NC} (${DISK_SIZE_MB} MB)"
+}
+
+# ============================================================
+# preflight_checks — validate environment
+# ============================================================
+preflight_checks() {
+    local mem_mb
+    mem_mb=$(free -m | awk 'NR==2 {print $2}')
+    info "RAM: ${mem_mb} MB"
+    [[ "$mem_mb" -lt 3600 ]] && die "Insufficient RAM: ${mem_mb} MB. Minimum 4 GB required."
+
+    # Check/install required tools
+    local need_install=()
+    command -v xz &>/dev/null || need_install+=(xz-utils)
+    command -v sgdisk &>/dev/null || need_install+=(gdisk)
+    command -v wget &>/dev/null || command -v curl &>/dev/null || need_install+=(wget)
+    if [[ -n "$OPT_SSHPASS" ]]; then
+        command -v expect &>/dev/null || need_install+=(expect)
+    fi
+
+    if [[ ${#need_install[@]} -gt 0 ]]; then
+        info "Installing missing packages: ${need_install[*]}"
+        if command -v apt-get &>/dev/null; then
+            apt-get update -q
+            apt-get install -y --no-install-recommends "${need_install[@]}" || warn "Some packages failed to install"
+        elif command -v yum &>/dev/null; then
+            yum install -y "${need_install[@]}" 2>/dev/null || warn "Some packages failed to install"
+        elif command -v pacman &>/dev/null; then
+            pacman -Sy --noconfirm "${need_install[@]}" 2>/dev/null || warn "Some packages failed to install"
+        else
+            warn "Cannot auto-install packages. Please install manually: ${need_install[*]}"
+        fi
+    fi
+
+    # Verify critical tools
+    for cmd in dd mount chroot blkid; do
+        command -v "$cmd" &>/dev/null || die "Required command not found: $cmd"
+    done
+    command -v xzcat &>/dev/null || command -v xz &>/dev/null || die "xz/xzcat not found"
+}
+
+# ============================================================
+# preserve_config — save rig configuration to tmpfs
+# ============================================================
+preserve_config() {
+    mkdir -p "${TMPDIR}/saved-config"
+
+    # CLI args take priority — if any is set, all three are required
+    if [[ -n "$OPT_RIG_ID" || -n "$OPT_PASSWORD" || -n "$OPT_SERVER" ]]; then
+        [[ -z "$OPT_RIG_ID" ]] && die "--rig-id is required when configuring via CLI"
+        [[ -z "$OPT_PASSWORD" ]] && die "--password is required when configuring via CLI"
+        [[ -z "$OPT_SERVER" ]] && die "--server is required when configuring via CLI"
+        cat > "${TMPDIR}/saved-config/agent.yaml" <<YAML
+server:
+  url: "${OPT_SERVER}"
+
+rig:
+  id: ${OPT_RIG_ID}
+  password: "${OPT_PASSWORD}"
+
+agent:
+  stats_interval: 5
+YAML
+        info "Config generated from CLI arguments (rig #${OPT_RIG_ID})"
+        return
+    fi
+
+    # OS.Dog v3 config
+    if [[ -f /opt/osdog/config.yaml ]]; then
+        cp /opt/osdog/config.yaml "${TMPDIR}/saved-config/agent.yaml"
+        info "Preserved config from /opt/osdog/config.yaml"
+        return
+    fi
+    if [[ -f /mnt/config/agent.yaml ]]; then
+        cp /mnt/config/agent.yaml "${TMPDIR}/saved-config/agent.yaml"
+        info "Preserved config from /mnt/config/agent.yaml"
+        return
+    fi
+
+    warn "No existing config found. Rig will need manual configuration after install."
+}
+
+# ============================================================
+# download_image — download .iso.xz to tmpfs
+# ============================================================
+download_image() {
+    local url="$IMAGE_URL"
+    local filename
+    filename=$(basename "$url")
+    IMAGE_FILE="${TMPDIR}/${filename}"
+
+    info "Downloading: ${BOLD}${filename}${NC}"
+
+    if [[ -n "$OPT_SSHPASS" ]]; then
+        download_scp "$url" "$IMAGE_FILE"
+    elif [[ "$url" == http* || "$url" == ftp* ]]; then
+        download_http "$url" "$IMAGE_FILE"
+    elif [[ -f "$url" ]]; then
+        info "Copying local file..."
+        cp "$url" "$IMAGE_FILE" || die "Failed to copy"
+    else
+        die "Cannot determine download method for: $url"
+    fi
+
+    [[ ! -f "$IMAGE_FILE" ]] && die "Download failed"
+
+    local size_mb
+    size_mb=$(du -m "$IMAGE_FILE" | cut -f1)
+    ok "Downloaded: ${filename} (${size_mb} MB)"
+}
+
+download_http() {
+    local url="$1" dest="$2"
+    if command -v wget &>/dev/null; then
+        wget -t 3 -T 30 --show-progress -O "$dest" "$url" || die "Download failed (wget)"
+    elif command -v curl &>/dev/null; then
+        curl -fL --progress-bar -o "$dest" "$url" || die "Download failed (curl)"
+    else
+        die "Neither wget nor curl available"
+    fi
+}
+
+download_scp() {
+    local url="$1" dest="$2"
+    command -v expect &>/dev/null || die "expect is required for SCP download"
+    expect -c "
+        set timeout 1200
+        spawn scp \"$url\" \"$dest\"
+        expect {
+            -re {.*continue connecting.*} { send \"yes\r\"; exp_continue }
+            -re {.*assword.*} { send \"${OPT_SSHPASS}\r\"; exp_continue }
+            -re {.*ermission denied.*} { exit 1 }
+            eof
+        }
+    " || die "SCP download failed"
+}
+
+# ============================================================
+# verify_image — check .iso.xz integrity
+# ============================================================
+verify_image() {
+    info "Verifying image integrity..."
+    if [[ "$IMAGE_FILE" == *.xz ]]; then
+        xz -t "$IMAGE_FILE" || die "Image is corrupted (xz check failed)"
+    elif [[ "$IMAGE_FILE" == *.iso ]]; then
+        info "Uncompressed .iso, skipping integrity check"
+        return
+    else
+        die "Unsupported format: expected .iso.xz or .iso"
+    fi
+    ok "Image integrity verified"
+}
+
+# ============================================================
+# stop_services — stop services, free RAM, release FS
+# ============================================================
+stop_services() {
+    info "Stopping services..."
+
+    # Suppress kernel messages
+    echo 0 > /proc/sys/kernel/printk 2>/dev/null || true
+    echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
+
+    swapoff -a 2>/dev/null || true
+
+    # Disable hardware watchdog (ref: mmp_rewrite.sh)
+    [[ -c /dev/watchdog ]] && echo "V" > /dev/watchdog 2>/dev/null || true
+
+    # Disable hung_task_timeout and tune dirty page writeback
+    [[ -f /proc/sys/kernel/hung_task_timeout_secs ]] && echo 0 > /proc/sys/kernel/hung_task_timeout_secs 2>/dev/null || true
+
+    # OS-specific stops
+    case "$CURRENT_OS" in
+        osdog-v3)
+            systemctl stop agent 2>/dev/null || true
+            pkill -9 Xorg 2>/dev/null || true
+            ;;
+        osdog-v1)
+            for svc in mining wd wd-load wd-kern wd-la wd-temp dogx af mb-af remotessh; do
+                systemctl stop "$svc" 2>/dev/null || true
+            done
+            pkill -9 xinit 2>/dev/null || true
+            ;;
+        hiveos)
+            # ref: github.com/minershive/hiveos-linux hive/sbin/hive-replace + mmp_rewrite.sh
+            autoswitch stop 2>/dev/null || true
+            miner stop 2>/dev/null || true
+            autofan stop 2>/dev/null || true
+            crontab -r 2>/dev/null || true
+            for svc in hivex hive-watchdog hive hive-console avg_khs; do
+                systemctl stop "${svc}.service" 2>/dev/null || true
+            done
+            # Kill miner screen sessions
+            screen -ls 2>/dev/null | grep -oP '^\s*\K[0-9]+' | xargs -r kill -9 2>/dev/null || true
+            killall -9 xinit 2>/dev/null || true
+            killall -9 Xorg 2>/dev/null || true
+            ;;
+        mmpos)
+            # ref: mmp_rewrite.sh
+            screen -ls 2>/dev/null | grep -oP '^\s*\K[0-9]+\.miner' | awk -F. '{print $1}' | xargs -r kill -9 2>/dev/null || true
+            # Disable MMPOS watchdog scripts
+            if [[ -d /root/utils ]]; then
+                mv -f /root/utils/force_reboot.sh /root/utils/force_reboot.sh.disable 2>/dev/null || true
+                mv -f /root/utils/force_shutdown.sh /root/utils/force_shutdown.sh.disable 2>/dev/null || true
+                mv -f /root/utils/watchdog_system.sh /root/utils/watchdog_system.sh.disable 2>/dev/null || true
+            fi
+            killall -9 Xorg 2>/dev/null || true
+            ;;
+        ethos)
+            # ref: mmp_rewrite.sh
+            minestop 2>/dev/null || true
+            disallow 2>/dev/null || true
+            mv -f /usr/bin/Xorg /usr/bin/Xorg.disable 2>/dev/null || true
+            mv -f /usr/bin/X /usr/bin/X.disable 2>/dev/null || true
+            mv -f /usr/bin/php /usr/bin/php.disable 2>/dev/null || true
+            /etc/init.d/udev stop 2>/dev/null || true
+            /etc/init.d/acpid stop 2>/dev/null || true
+            /etc/init.d/x11-common stop 2>/dev/null || true
+            killall -9 Xorg 2>/dev/null || true
+            ;;
+        raveos)
+            # TODO: verify on real RaveOS machine
+            for svc in rave-agent rave-watcher; do
+                systemctl stop "$svc" 2>/dev/null || true
+            done
+            pkill -9 Xorg 2>/dev/null || true
+            ;;
+    esac
+
+    # Generic: stop non-essential systemd services
+    local keep="ssh|sshd|openvpn|network|ifup|systemd-|dbus|getty|login|netdd"
+    local my_tty
+    my_tty=$(tty 2>/dev/null | grep -oP 'tty[0-9]+' || true)
+    [[ -n "$my_tty" ]] && keep+="|$my_tty"
+
+    while IFS= read -r svc; do
+        [[ -z "$svc" ]] && continue
+        echo "$svc" | grep -qP "$keep" && continue
+        systemctl stop "$svc" 2>/dev/null || true
+    done < <(systemctl list-units --type=service --state=running --no-legend 2>/dev/null | awk '{print $1}')
+
+    # Kill remaining processes holding root FS
+    local attempt
+    for attempt in 1 2 3; do
+        while IFS= read -r pid; do
+            [[ -z "$pid" || "$pid" == "$$" ]] && continue
+            kill -9 "$pid" 2>/dev/null || true
+        done < <(lsof / 2>/dev/null | grep -vP "COMMAND|$SCRIPT_NAME|ssh|sshd|network" | awk '{print $2}' | sort -u)
+        sleep 1
+    done
+}
+
+# ============================================================
+# copy_with_libs — copy binary + its shared library deps
+# ============================================================
+copy_with_libs() {
+    local src="$1"
+    [[ ! -f "$src" ]] && return
+
+    # Resolve symlinks so we copy the real binary
+    local real_src
+    real_src=$(readlink -f "$src")
+
+    # Copy to both the original path and the resolved path
+    local dest="${TMPDIR}/root${src}"
+    local real_dest="${TMPDIR}/root${real_src}"
+
+    # Copy real binary
+    if [[ ! -f "$real_dest" ]]; then
+        mkdir -p "$(dirname "$real_dest")"
+        cp "$real_src" "$real_dest" 2>/dev/null || return
+    fi
+
+    # Symlink if paths differ
+    if [[ "$src" != "$real_src" && ! -e "$dest" ]]; then
+        mkdir -p "$(dirname "$dest")"
+        ln -sf "$real_src" "$dest" 2>/dev/null || true
+    fi
+
+    # Copy shared libraries
+    local libs
+    libs=$(ldd "$real_src" 2>/dev/null | grep -oP '/\S+' || true)
+    for lib in $libs; do
+        local lib_dest="${TMPDIR}/root${lib}"
+        [[ -f "$lib_dest" ]] && continue
+        mkdir -p "$(dirname "$lib_dest")"
+        cp -a "$lib" "$lib_dest" 2>/dev/null || true
+        # Follow symlinks
+        if [[ -L "$lib" ]]; then
+            local target
+            target=$(readlink -f "$lib")
+            local target_dest="${TMPDIR}/root${target}"
+            if [[ ! -f "$target_dest" && -f "$target" ]]; then
+                mkdir -p "$(dirname "$target_dest")"
+                cp -a "$target" "$target_dest" 2>/dev/null || true
+            fi
+        fi
+    done
+}
+
+# ============================================================
+# build_tmpfs_root — create minimal chroot in tmpfs
+# ============================================================
+build_tmpfs_root() {
+    info "Building temporary root filesystem in RAM..."
+
+    local chroot_dir="${TMPDIR}/root"
+    mkdir -p "${chroot_dir}"/{proc,sys,dev,tmp,etc,usr/bin,usr/lib,usr/sbin}
+    ln -sf usr/bin  "${chroot_dir}/bin"
+    ln -sf usr/sbin "${chroot_dir}/sbin"
+    ln -sf usr/lib  "${chroot_dir}/lib"
+    mkdir -p "${chroot_dir}/usr/lib64"
+    ln -sf usr/lib64 "${chroot_dir}/lib64"
+
+    # Binaries needed in chroot
+    local bins=(
+        bash sh dd cat mount umount sync sleep tee mkdir cp
+        sgdisk partprobe blkid losetup
+        lsof kill pkill tty pstree
+        grep sed awk head tail basename dirname tr
+        echo printf reboot
+    )
+
+    # Add xzcat or xz
+    if command -v xzcat &>/dev/null; then
+        bins+=(xzcat)
+    else
+        bins+=(xz)
+    fi
+
+    # Copy each binary and its shared library dependencies
+    for bin_name in "${bins[@]}"; do
+        local bin_path
+        bin_path=$(command -v "$bin_name" 2>/dev/null) || continue
+        copy_with_libs "$bin_path"
+    done
+
+    # Essential config files
+    cp -a /etc/ld.so.cache "${chroot_dir}/etc/" 2>/dev/null || true
+    cp -a /etc/ld.so.conf* "${chroot_dir}/etc/" 2>/dev/null || true
+    cp -a /etc/nsswitch.conf "${chroot_dir}/etc/" 2>/dev/null || true
+
+    # Bind mounts
+    mount --bind /proc "${chroot_dir}/proc"
+    mount --bind /sys "${chroot_dir}/sys"
+    mount --bind /dev "${chroot_dir}/dev"
+
+    # Copy this script
+    cp "${SCRIPT_PATH}/${SCRIPT_NAME}" "${chroot_dir}/${SCRIPT_NAME}"
+    chmod +x "${chroot_dir}/${SCRIPT_NAME}"
+
+    # Move image and saved config into chroot
+    [[ -f "$IMAGE_FILE" ]] && mv "$IMAGE_FILE" "${chroot_dir}/$(basename "$IMAGE_FILE")"
+    [[ -d "${TMPDIR}/saved-config" ]] && cp -a "${TMPDIR}/saved-config" "${chroot_dir}/saved-config"
+
+    # Write phase 2 config
+    cat > "${chroot_dir}/replace.conf" <<CONF
+DISK_NAME=${DISK_NAME}
+IMAGE_FILE=$(basename "$IMAGE_FILE")
+CONF
+
+    # Remount root filesystems read-only (ref: mmp_rewrite.sh — double remount + sysrq)
+    info "Remounting filesystems read-only..."
+    while IFS= read -r mnt; do
+        mount -n -o remount,ro "$mnt" 2>/dev/null || true
+    done < <(mount | grep "/dev/${DISK_NAME}" | awk '{print $3}' | sort -r)
+
+    # sysrq emergency remount — catches anything still mounted RW
+    echo u > /proc/sysrq-trigger 2>/dev/null || true
+    sleep 1
+
+    # Second pass (ref: mmp_rewrite.sh does this twice)
+    while IFS= read -r mnt; do
+        mount -n -o remount,ro "$mnt" 2>/dev/null || true
+    done < <(mount | grep "/dev/${DISK_NAME}" | awk '{print $3}' | sort -r)
+    echo u > /proc/sysrq-trigger 2>/dev/null || true
+
+    sync
+
+    # Save caller's tty so Phase 2 output is visible over SSH
+    local caller_tty
+    caller_tty=$(tty 2>/dev/null) || true
+    if [[ -n "$caller_tty" && -w "$caller_tty" ]]; then
+        echo "$caller_tty" > "${chroot_dir}/caller_tty"
+    fi
+
+    # Chroot and re-exec this script
+    info "Entering tmpfs chroot..."
+    local bash_path
+    bash_path=$(command -v bash)
+    exec chroot "${chroot_dir}" "${bash_path}" "/${SCRIPT_NAME}"
+}
+
+# ============================================================
+# Phase 2 functions (run from tmpfs chroot)
+# ============================================================
+
+write_image() {
+    info "Writing OS.Dog v3 to ${BOLD}/dev/${DISK_NAME}${NC}..."
+    warn "Do NOT power off until this completes!"
+    echo ""
+
+    local exitcode=0
+    if command -v xzcat &>/dev/null; then
+        local decompress="xzcat"
+    else
+        local decompress="xz -dc"
+    fi
+
+    if [[ "$IMAGE_FILE" == *.xz ]]; then
+        if dd --help 2>&1 | grep -q "'progress'" 2>/dev/null; then
+            $decompress "/${IMAGE_FILE}" | dd of="/dev/${DISK_NAME}" bs=1M status=progress || exitcode=$?
+        else
+            $decompress "/${IMAGE_FILE}" | dd of="/dev/${DISK_NAME}" bs=1M 2>/tmp/dd_progress &
+            local dd_pid=$!
+            while kill -0 "$dd_pid" 2>/dev/null; do
+                sleep 3
+                kill -USR1 "$dd_pid" 2>/dev/null || true
+                tail -1 /tmp/dd_progress 2>/dev/null | tr '\r' '\n' | tail -1
+            done
+            wait "$dd_pid" || exitcode=$?
+        fi
+    elif [[ "$IMAGE_FILE" == *.iso ]]; then
+        dd if="/${IMAGE_FILE}" of="/dev/${DISK_NAME}" bs=1M status=progress || exitcode=$?
+    else
+        die "Unsupported image format"
+    fi
+
+    [[ $exitcode -ne 0 ]] && die "Image write failed (exit code: $exitcode)"
+
+    sync
+    ok "Image written successfully"
+}
+
+fix_gpt() {
+    info "Fixing GPT partition table..."
+    # Unmount stale partitions so kernel can re-read the table
+    umount -f /dev/${DISK_NAME}?* 2>/dev/null || true
+    umount -f /dev/${DISK_NAME}p?* 2>/dev/null || true
+
+    sgdisk -e "/dev/${DISK_NAME}" 2>/dev/null || true
+    sgdisk -C "/dev/${DISK_NAME}" 2>/dev/null || true
+    partprobe "/dev/${DISK_NAME}" 2>/dev/null || true
+    sleep 2
+    ok "GPT fixed"
+}
+
+restore_config() {
+    [[ ! -f /saved-config/agent.yaml ]] && { warn "No config to restore"; return; }
+
+    info "Restoring config to partition 1..."
+
+    # After dd, /dev/sda1 is stale (kernel holds old partition table).
+    # Use losetup with offset directly on /dev/sda to bypass stale nodes.
+    local start_sector size_sectors
+    start_sector=$(sgdisk -i 1 "/dev/${DISK_NAME}" 2>/dev/null | grep "First sector" | awk '{print $3}')
+    size_sectors=$(sgdisk -i 1 "/dev/${DISK_NAME}" 2>/dev/null | grep "Partition size" | awk '{print $3}')
+
+    if [[ -z "$start_sector" || -z "$size_sectors" ]]; then
+        warn "Failed to read partition 1 geometry from GPT"
+        return
+    fi
+
+    local offset=$(( start_sector * 512 ))
+    local sizelimit=$(( size_sectors * 512 ))
+
+    local loop_dev
+    loop_dev=$(losetup --find --show -o "$offset" --sizelimit "$sizelimit" "/dev/${DISK_NAME}" 2>/dev/null)
+    if [[ -z "$loop_dev" ]]; then
+        warn "Failed to setup loop device on /dev/${DISK_NAME} offset ${offset}"
+        return
+    fi
+
+    mkdir -p /tmp/cfg
+    if mount "$loop_dev" /tmp/cfg 2>/dev/null; then
+        cp /saved-config/agent.yaml /tmp/cfg/agent.yaml
+        sync
+        umount /tmp/cfg
+
+        echo ""
+        echo -e "${CYAN}Applied configuration:${NC}"
+        echo "========================"
+        cat /saved-config/agent.yaml
+        echo "========================"
+        ok "Configuration restored"
+    else
+        warn "Failed to mount config partition via loopback"
+    fi
+
+    losetup -d "$loop_dev" 2>/dev/null || true
+}
+
+reboot_system() {
+    echo ""
+    ok "OS.Dog v3 installed successfully!"
+    echo -e "After reboot the rig should appear on the web dashboard."
+    echo ""
+    info "Rebooting in 10 seconds... (Ctrl+C to cancel)"
+
+    sleep 10
+
+    # sysrq is the most reliable from chroot
+    echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
+    echo b > /proc/sysrq-trigger 2>/dev/null || true
+
+    # Fallback
+    sleep 3
+    reboot -f 2>/dev/null || true
+
+    sleep 5
+    die "Reboot failed. Please reboot manually."
+}
+
+# ============================================================
+# Phase orchestrators
+# ============================================================
+phase1_prepare() {
+    show_banner
+    detect_os
+    detect_disk
+    preflight_checks
+
+    echo ""
+    echo -e "Image:  ${GREEN}${IMAGE_URL}${NC}"
+    echo -e "Disk:   ${PURPLE}/dev/${DISK_NAME}${NC} (${DISK_SIZE_MB} MB)"
+    echo -e "OS:     ${CYAN}${CURRENT_OS}${NC}"
+    echo ""
+
+    if [[ "$OPT_YES" != "1" ]]; then
+        echo -e "${RED}${BOLD}WARNING: ALL DATA on /dev/${DISK_NAME} WILL BE DESTROYED!${NC}"
+        echo -en "Type ${GREEN}yes${NC} to continue: "
+        local answer
+        read -t 120 -r answer || true
+        [[ "$answer" != "yes" ]] && { echo ""; die "Aborted"; }
+    fi
+
+    echo ""
+
+    # Mount tmpfs early (before stopping miners to free RAM)
+    mkdir -p "$TMPDIR"
+    if ! mount | grep -q "$TMPDIR"; then
+        mount -t tmpfs -o size=3500m none "$TMPDIR"
+    fi
+
+    preserve_config
+    download_image
+    verify_image
+    stop_services
+    build_tmpfs_root
+    # build_tmpfs_root does exec chroot — never returns
+}
+
+phase2_write() {
+    # Restore output to caller's tty (SSH session)
+    if [[ -f /caller_tty ]]; then
+        local tty
+        tty=$(cat /caller_tty)
+        if [[ -w "$tty" ]]; then
+            exec > >(tee "$tty") 2>&1
+        fi
+    fi
+
+    echo ""
+    info "Phase 2: Writing image to disk"
+    echo ""
+    write_image
+    fix_gpt
+    restore_config
+    reboot_system
+}
+
+# ============================================================
+# start — phase router
+# ============================================================
+start() {
+    if [[ -f /replace.conf ]]; then
+        # Phase 2: we are inside tmpfs chroot
+        # shellcheck disable=SC1091
+        source /replace.conf
+        phase2_write
+    else
+        # Phase 1: running on live system
+        IMAGE_URL="$OPT_URL"
+        [[ -z "$IMAGE_URL" ]] && { show_banner; show_help; die "Image URL is required"; }
+        phase1_prepare
+    fi
+}
+
+# ============================================================
+# main — argument parser + entry point
+# ============================================================
+main() {
+    # Handle --help before root check
+    for arg in "$@"; do
+        if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+            show_banner
+            show_help
+            exit 0
+        fi
+    done
+
+    # Self-elevate to root
+    if [[ $EUID -ne 0 ]]; then
+        echo "Root privileges required"
+        exec sudo "$0" "$@"
+    fi
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -y|--yes)
+                OPT_YES=1
+                ;;
+            --rig-id)
+                shift
+                [[ $# -eq 0 ]] && die "--rig-id requires a value"
+                OPT_RIG_ID="$1"
+                ;;
+            --password)
+                shift
+                [[ $# -eq 0 ]] && die "--password requires a value"
+                OPT_PASSWORD="$1"
+                ;;
+            --server)
+                shift
+                [[ $# -eq 0 ]] && die "--server requires a value"
+                OPT_SERVER="$1"
+                ;;
+            --sshpass)
+                shift
+                [[ $# -eq 0 ]] && die "--sshpass requires a value"
+                OPT_SSHPASS="$1"
+                ;;
+            *.iso.xz|*.iso|http*|ftp*|scp:*)
+                OPT_URL="$1"
+                ;;
+            *)
+                die "Unknown option: $1 (use --help)"
+                ;;
+        esac
+        shift
+    done
+
+    start
+}
+
+main "$@"

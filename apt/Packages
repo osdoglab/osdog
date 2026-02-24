@@ -1,0 +1,16 @@
+Package: osdog-base
+Architecture: all
+Version: 1.0.3
+Priority: optional
+Section: admin
+Maintainer: osdoglab <osdoglab@users.noreply.github.com>
+Depends: bash-completion, nano, mc, htop, sudo
+Filename: ./osdog-base_1.0.3_all.deb
+Size: 1992
+MD5sum: 91c80dbad8a2c50050a1b9ff3b35c298
+SHA1: 6cc16582d1095edc542809759e53dcb43d1a79b7
+SHA256: 590f953c0e30cb4e5085392e999351cd26fa524481e32a3af0b9fc3571685fb5
+SHA512: 7e9bcd9fc6ec31bd593a9daa5ef7ceeaf6d8bea5ff50940bd6b2134c0692fe4f51dd52428b17b0dc1fa0485e9b5fea21af950d4114ca2294a1093743ce955e8f
+Description: OS.Dog base system configuration
+ SSH banner, shell prompt, autologin, sshd defaults.
+
