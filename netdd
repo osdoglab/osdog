@@ -254,14 +254,9 @@ YAML
     fi
 
     # OS.Dog v3 config
-    if [[ -f /opt/osdog/config.yaml ]]; then
-        cp /opt/osdog/config.yaml "${TMPDIR}/saved-config/agent.yaml"
-        info "Preserved config from /opt/osdog/config.yaml"
-        return
-    fi
-    if [[ -f /mnt/config/agent.yaml ]]; then
-        cp /mnt/config/agent.yaml "${TMPDIR}/saved-config/agent.yaml"
-        info "Preserved config from /mnt/config/agent.yaml"
+    if [[ -f /opt/osdog/config/agent.yaml ]]; then
+        cp /opt/osdog/config/agent.yaml "${TMPDIR}/saved-config/agent.yaml"
+        info "Preserved config from /opt/osdog/config/agent.yaml"
         return
     fi
 
