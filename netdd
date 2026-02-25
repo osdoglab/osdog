@@ -498,7 +498,7 @@ build_tmpfs_root() {
     # Binaries needed in chroot
     local bins=(
         bash sh dd cat mount umount sync sleep tee mkdir cp
-        sgdisk partprobe blkid losetup
+        sgdisk partprobe blkid losetup blockdev
         lsof kill pkill tty pstree
         grep sed awk head tail basename dirname tr
         echo printf reboot
