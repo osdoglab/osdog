@@ -209,7 +209,7 @@ preflight_checks() {
     if [[ ${#need_install[@]} -gt 0 ]]; then
         info "Installing missing packages: ${need_install[*]}"
         if command -v apt-get &>/dev/null; then
-            apt-get update -q
+            apt-get update -q -o Acquire::AllowInsecureRepositories=true 2>/dev/null || true
             apt-get install -y --no-install-recommends "${need_install[@]}" || warn "Some packages failed to install"
         elif command -v yum &>/dev/null; then
             yum install -y "${need_install[@]}" 2>/dev/null || warn "Some packages failed to install"
