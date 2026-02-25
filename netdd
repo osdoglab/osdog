@@ -633,8 +633,9 @@ restore_config() {
 
     info "Restoring config to partition 1..."
 
-    # After dd, /dev/sda1 is stale (kernel holds old partition table).
-    # Use losetup with offset directly on /dev/sda to bypass stale nodes.
+    # After dd the kernel's partition table is stale. Mounting the block device
+    # directly can hit cached/stale data. Instead, copy the partition into a
+    # file, mount the file, write config, then dd it back.
     local start_sector size_sectors
     start_sector=$(sgdisk -i 1 "/dev/${DISK_NAME}" 2>/dev/null | grep "First sector" | awk '{print $3}')
     size_sectors=$(sgdisk -i 1 "/dev/${DISK_NAME}" 2>/dev/null | grep "Partition size" | awk '{print $3}')
@@ -647,10 +648,18 @@ restore_config() {
     local offset=$(( start_sector * 512 ))
     local sizelimit=$(( size_sectors * 512 ))
 
+    # Read partition into a file
+    dd if="/dev/${DISK_NAME}" of=/tmp/cfg.img bs=512 skip="$start_sector" count="$size_sectors" 2>/dev/null
+    if [[ ! -f /tmp/cfg.img ]]; then
+        warn "Failed to read config partition"
+        return
+    fi
+
     local loop_dev
-    loop_dev=$(losetup --find --show -o "$offset" --sizelimit "$sizelimit" "/dev/${DISK_NAME}" 2>/dev/null)
+    loop_dev=$(losetup --find --show /tmp/cfg.img 2>/dev/null)
     if [[ -z "$loop_dev" ]]; then
-        warn "Failed to setup loop device on /dev/${DISK_NAME} offset ${offset}"
+        warn "Failed to setup loop device for config image"
+        rm -f /tmp/cfg.img
         return
     fi
 
@@ -660,6 +669,10 @@ restore_config() {
         sync
         umount /tmp/cfg
 
+        # Write the modified image back to disk
+        dd if=/tmp/cfg.img of="/dev/${DISK_NAME}" bs=512 seek="$start_sector" count="$size_sectors" conv=notrunc 2>/dev/null
+        sync
+
         echo ""
         echo -e "${CYAN}Applied configuration:${NC}"
         echo "========================"
@@ -667,10 +680,11 @@ restore_config() {
         echo "========================"
         ok "Configuration restored"
     else
-        warn "Failed to mount config partition via loopback"
+        warn "Failed to mount config partition image"
     fi
 
     losetup -d "$loop_dev" 2>/dev/null || true
+    rm -f /tmp/cfg.img
 }
 
 reboot_system() {
