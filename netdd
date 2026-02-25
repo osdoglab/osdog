@@ -583,6 +583,11 @@ write_image() {
     warn "Do NOT power off until this completes!"
     echo ""
 
+    # Drop kernel caches and flush block device buffers to prevent
+    # stale cached data from being written back over the new image
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    blockdev --flushbufs "/dev/${DISK_NAME}" 2>/dev/null || true
+
     local exitcode=0
     if command -v xzcat &>/dev/null; then
         local decompress="xzcat"
@@ -592,9 +597,9 @@ write_image() {
 
     if [[ "$IMAGE_FILE" == *.xz ]]; then
         if dd --help 2>&1 | grep -q "'progress'" 2>/dev/null; then
-            $decompress "/${IMAGE_FILE}" | dd of="/dev/${DISK_NAME}" bs=1M status=progress || exitcode=$?
+            $decompress "/${IMAGE_FILE}" | dd of="/dev/${DISK_NAME}" bs=1M oflag=direct status=progress || exitcode=$?
         else
-            $decompress "/${IMAGE_FILE}" | dd of="/dev/${DISK_NAME}" bs=1M 2>/tmp/dd_progress &
+            $decompress "/${IMAGE_FILE}" | dd of="/dev/${DISK_NAME}" bs=1M oflag=direct 2>/tmp/dd_progress &
             local dd_pid=$!
             while kill -0 "$dd_pid" 2>/dev/null; do
                 sleep 3
@@ -604,7 +609,7 @@ write_image() {
             wait "$dd_pid" || exitcode=$?
         fi
     elif [[ "$IMAGE_FILE" == *.iso ]]; then
-        dd if="/${IMAGE_FILE}" of="/dev/${DISK_NAME}" bs=1M status=progress || exitcode=$?
+        dd if="/${IMAGE_FILE}" of="/dev/${DISK_NAME}" bs=1M oflag=direct status=progress || exitcode=$?
     else
         die "Unsupported image format"
     fi
