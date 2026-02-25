@@ -633,37 +633,65 @@ fix_gpt() {
     ok "GPT fixed"
 }
 
-restore_config() {
+# Global for config partition geometry (set by prepare_config, used by write_config_to_disk)
+CFG_START_SECTOR=""
+CFG_SIZE_SECTORS=""
+
+prepare_config() {
     [[ ! -f /saved-config/agent.yaml ]] && { warn "No config to restore"; return; }
 
-    info "Restoring config to partition 1..."
+    info "Preparing config from image archive..."
 
-    # After dd the kernel's partition table is stale. Mounting the block device
-    # directly can hit cached/stale data. Instead, copy the partition into a
-    # file, mount the file, write config, then dd it back.
-    local start_sector size_sectors
-    start_sector=$(sgdisk -i 1 "/dev/${DISK_NAME}" 2>/dev/null | grep "First sector" | awk '{print $3}')
-    size_sectors=$(sgdisk -i 1 "/dev/${DISK_NAME}" 2>/dev/null | grep "Partition size" | awk '{print $3}')
+    # Determine decompression command
+    local decompress=""
+    if [[ "$IMAGE_FILE" == *.xz ]]; then
+        if command -v xzcat &>/dev/null; then
+            decompress="xzcat"
+        else
+            decompress="xz -dc"
+        fi
+    fi
 
-    if [[ -z "$start_sector" || -z "$size_sectors" ]]; then
-        warn "Failed to read partition 1 geometry from GPT"
+    # Extract GPT header from image (first 2 MB is plenty)
+    # || true: xzcat gets SIGPIPE when dd closes the pipe early, which is expected
+    if [[ -n "$decompress" ]]; then
+        $decompress "/${IMAGE_FILE}" | dd of=/tmp/gpt.img bs=1M count=2 2>/dev/null || true
+    else
+        dd if="/${IMAGE_FILE}" of=/tmp/gpt.img bs=1M count=2 2>/dev/null
+    fi
+
+    # Read partition 1 geometry from GPT
+    CFG_START_SECTOR=$(sgdisk -i 1 /tmp/gpt.img 2>/dev/null | grep "First sector" | awk '{print $3}')
+    CFG_SIZE_SECTORS=$(sgdisk -i 1 /tmp/gpt.img 2>/dev/null | grep "Partition size" | awk '{print $3}')
+
+    rm -f /tmp/gpt.img
+
+    if [[ -z "$CFG_START_SECTOR" || -z "$CFG_SIZE_SECTORS" ]]; then
+        warn "Cannot read partition 1 geometry from image GPT"
+        return
+    fi
+    info "Config partition: start=${CFG_START_SECTOR}, size=${CFG_SIZE_SECTORS} sectors"
+
+    # Extract config partition from archive into a file
+    # || true: same SIGPIPE reason as above
+    if [[ -n "$decompress" ]]; then
+        $decompress "/${IMAGE_FILE}" | dd of=/tmp/cfg.img bs=512 skip="$CFG_START_SECTOR" count="$CFG_SIZE_SECTORS" 2>/dev/null || true
+    else
+        dd if="/${IMAGE_FILE}" of=/tmp/cfg.img bs=512 skip="$CFG_START_SECTOR" count="$CFG_SIZE_SECTORS" 2>/dev/null
+    fi
+
+    if [[ ! -s /tmp/cfg.img ]]; then
+        warn "Failed to extract config partition from image"
+        CFG_START_SECTOR=""
         return
     fi
 
-    local offset=$(( start_sector * 512 ))
-    local sizelimit=$(( size_sectors * 512 ))
-
-    # Read partition into a file
-    dd if="/dev/${DISK_NAME}" of=/tmp/cfg.img bs=512 skip="$start_sector" count="$size_sectors" 2>/dev/null
-    if [[ ! -f /tmp/cfg.img ]]; then
-        warn "Failed to read config partition"
-        return
-    fi
-
+    # Mount the extracted partition and write config
     local loop_dev
     loop_dev=$(losetup --find --show /tmp/cfg.img 2>/dev/null)
     if [[ -z "$loop_dev" ]]; then
-        warn "Failed to setup loop device for config image"
+        warn "Failed to setup loop device"
+        CFG_START_SECTOR=""
         return
     fi
 
@@ -672,22 +700,28 @@ restore_config() {
         cp /saved-config/agent.yaml /tmp/cfg/agent.yaml
         sync
         umount /tmp/cfg
-
-        # Write the modified image back to disk
-        dd if=/tmp/cfg.img of="/dev/${DISK_NAME}" bs=512 seek="$start_sector" count="$size_sectors" conv=notrunc 2>/dev/null
-        sync
-
-        echo ""
-        echo -e "${CYAN}Applied configuration:${NC}"
-        echo "========================"
-        cat /saved-config/agent.yaml
-        echo "========================"
-        ok "Configuration restored"
+        ok "Config written to partition image"
     else
         warn "Failed to mount config partition image"
+        CFG_START_SECTOR=""
     fi
 
     losetup -d "$loop_dev" 2>/dev/null || true
+}
+
+write_config_to_disk() {
+    [[ -z "$CFG_START_SECTOR" || ! -s /tmp/cfg.img ]] && return
+
+    info "Writing config partition to disk..."
+    dd if=/tmp/cfg.img of="/dev/${DISK_NAME}" bs=512 seek="$CFG_START_SECTOR" count="$CFG_SIZE_SECTORS" conv=notrunc oflag=direct 2>/dev/null
+    sync
+
+    echo ""
+    echo -e "${CYAN}Applied configuration:${NC}"
+    echo "========================"
+    cat /saved-config/agent.yaml
+    echo "========================"
+    ok "Configuration restored"
 }
 
 reboot_system() {
@@ -763,9 +797,17 @@ phase2_write() {
     echo ""
     info "Phase 2: Writing image to disk"
     echo ""
+
+    # Extract config partition from archive BEFORE writing image to disk.
+    # After write_image the disk should never be read back (kernel cache issues).
+    prepare_config
+
     write_image
     fix_gpt
-    restore_config
+
+    # Write pre-prepared config partition to disk (no disk reads involved)
+    write_config_to_disk
+
     reboot_system
 }
 
