@@ -1,5 +1,5 @@
 Package: osdog-base
-Version: 1.0.3
+Version: 1.0.4
 Architecture: all
 Maintainer: osdoglab <osdoglab@users.noreply.github.com>
 Depends: bash-completion, nano, mc, htop, sudo

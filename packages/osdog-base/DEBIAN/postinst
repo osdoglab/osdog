@@ -52,6 +52,10 @@ echo -e "${C}                                                   888${R}"
 echo -e "${C}                                              Y8b d88P${R}"
 echo -e "${C}                           ${Y}v3${C}                  \"Y88P\"${R}"
 echo ""
+IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+UP=$(uptime -p 2>/dev/null || uptime | sed 's/.*up /up /' | sed 's/,.*load.*//')
+echo -e "  ${W}IP:${D} ${IP:-unknown}    ${W}Uptime:${D} ${UP}${R}"
+echo ""
 echo -e "  ${W}Commands:${R}"
 echo -e "    ${G}agent status${D}       daemon status and version${R}"
 echo -e "    ${G}agent log${D}          show miner log${R}"
