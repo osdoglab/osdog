@@ -659,7 +659,6 @@ restore_config() {
     loop_dev=$(losetup --find --show /tmp/cfg.img 2>/dev/null)
     if [[ -z "$loop_dev" ]]; then
         warn "Failed to setup loop device for config image"
-        rm -f /tmp/cfg.img
         return
     fi
 
@@ -684,7 +683,6 @@ restore_config() {
     fi
 
     losetup -d "$loop_dev" 2>/dev/null || true
-    rm -f /tmp/cfg.img
 }
 
 reboot_system() {
