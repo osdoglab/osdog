@@ -126,10 +126,10 @@ show_help() {
 # detect_os — detect current running OS
 # ============================================================
 detect_os() {
-    if [[ -f /etc/osdog-release ]]; then
+    if [[ -f /dog/boot ]]; then
+        CURRENT_OS="osdog-v2"
+    elif [[ -f /etc/osdog-release ]]; then
         CURRENT_OS="osdog-v3"
-    elif [[ -f /dog/boot ]]; then
-        CURRENT_OS="osdog-v1"
     elif [[ -f /opt/ethos/etc/version ]]; then
         CURRENT_OS="ethos"
     elif [[ -d /opt/mmp || -f /etc/mmp-release ]]; then
@@ -149,7 +149,8 @@ detect_os() {
 # ============================================================
 detect_disk() {
     local root_spec
-    root_spec=$(tr ' ' '\n' < /proc/cmdline | grep -E '^root=' | head -1 | sed 's/^root=//') || true
+    # Take the LAST root= parameter (Linux kernel uses the last one)
+    root_spec=$(tr ' ' '\n' < /proc/cmdline | grep -E '^root=' | tail -1 | sed 's/^root=//') || true
 
     local root_part=""
     if [[ "$root_spec" == UUID=* ]]; then
@@ -260,6 +261,31 @@ YAML
         return
     fi
 
+    # OS.Dog v2 config — convert rig.cfg to agent.yaml
+    if [[ -f /dog/cfg/rig.cfg ]]; then
+        local rig_id="" passwd="" host=""
+        # shellcheck disable=SC1091
+        source /dog/cfg/rig.cfg 2>/dev/null || true
+        rig_id="${RIG_ID:-}"
+        passwd="${PASSWD:-}"
+        host="${HOST:-wss://os.dog}"
+        if [[ -n "$rig_id" && -n "$passwd" ]]; then
+            cat > "${TMPDIR}/saved-config/agent.yaml" <<YAML
+server:
+  url: "${host}"
+
+rig:
+  id: ${rig_id}
+  password: "${passwd}"
+
+agent:
+  stats_interval: 5
+YAML
+            info "Preserved config from /dog/cfg/rig.cfg (v2, rig #${rig_id})"
+            return
+        fi
+    fi
+
     warn "No existing config found. Rig will need manual configuration after install."
 }
 
@@ -319,6 +345,189 @@ download_scp() {
 }
 
 # ============================================================
+# download_chroot — download netdd-chroot.tar.xz
+# ============================================================
+download_chroot() {
+    local chroot_file="netdd-chroot.tar.xz"
+
+    # 1. Extract chroot from the downloaded image's config partition (freshest)
+    if [[ -f "$IMAGE_FILE" ]]; then
+        info "Extracting chroot from image config partition..."
+        extract_chroot_from_image "$IMAGE_FILE" "${TMPDIR}/${chroot_file}" || true
+    fi
+
+    # 2. Try downloading from the same URL directory as the image
+    if [[ ! -f "${TMPDIR}/${chroot_file}" ]]; then
+        local chroot_url=""
+        if [[ "$IMAGE_URL" == http* || "$IMAGE_URL" == ftp* ]]; then
+            chroot_url="${IMAGE_URL%/*}/${chroot_file}"
+        elif [[ -n "$OPT_SSHPASS" ]]; then
+            chroot_url="${IMAGE_URL%/*}/${chroot_file}"
+        elif [[ -f "$IMAGE_URL" ]]; then
+            local dir
+            dir=$(dirname "$IMAGE_URL")
+            [[ -f "${dir}/${chroot_file}" ]] && chroot_url="${dir}/${chroot_file}"
+        fi
+
+        if [[ -n "$chroot_url" ]]; then
+            info "Downloading chroot archive: ${BOLD}${chroot_file}${NC}"
+            if [[ -n "$OPT_SSHPASS" ]]; then
+                download_scp "$chroot_url" "${TMPDIR}/${chroot_file}" 2>/dev/null || true
+            elif [[ "$chroot_url" == http* || "$chroot_url" == ftp* ]]; then
+                download_http "$chroot_url" "${TMPDIR}/${chroot_file}" 2>/dev/null || true
+            elif [[ -f "$chroot_url" ]]; then
+                cp "$chroot_url" "${TMPDIR}/${chroot_file}" 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    # 3. Try local config partition of the running system
+    if [[ ! -f "${TMPDIR}/${chroot_file}" ]]; then
+        for dir in /opt/osdog/config /dog-flash; do
+            if [[ -f "${dir}/${chroot_file}" ]]; then
+                info "Using local chroot archive: ${BOLD}${dir}/${chroot_file}${NC}"
+                cp "${dir}/${chroot_file}" "${TMPDIR}/${chroot_file}" 2>/dev/null || true
+                break
+            fi
+        done
+    fi
+
+    if [[ -f "${TMPDIR}/${chroot_file}" ]]; then
+        local size_mb
+        size_mb=$(du -m "${TMPDIR}/${chroot_file}" | cut -f1)
+        ok "Chroot archive: ${size_mb} MB"
+    else
+        warn "Chroot archive not available, building from system..."
+        build_chroot_from_system
+    fi
+}
+
+# ============================================================
+# extract_chroot_from_image — get netdd-chroot.tar.xz from image's config partition
+# ============================================================
+extract_chroot_from_image() {
+    local image="$1" dest="$2"
+    local chroot_file
+    chroot_file=$(basename "$dest")
+
+    # Determine decompression command
+    local decompress=""
+    if [[ "$image" == *.xz ]]; then
+        if command -v xzcat &>/dev/null; then
+            decompress="xzcat"
+        else
+            decompress="xz -dc"
+        fi
+    fi
+
+    # Read GPT header (first 34 sectors)
+    local gpt_tmp="${TMPDIR}/gpt-chroot.img"
+    if [[ -n "$decompress" ]]; then
+        $decompress "$image" | dd of="$gpt_tmp" bs=512 count=34 2>/dev/null
+    else
+        dd if="$image" of="$gpt_tmp" bs=512 count=34 2>/dev/null
+    fi
+
+    [[ ! -s "$gpt_tmp" ]] && { warn "Cannot read GPT from image"; return 1; }
+
+    # Parse partition 1 geometry from GPT
+    local cfg_start cfg_end cfg_size
+    cfg_start=$(dd if="$gpt_tmp" bs=1 skip=1056 count=4 2>/dev/null | od -A n -t u1 | awk '{print $1 + $2*256 + $3*65536 + $4*16777216}')
+    cfg_end=$(dd if="$gpt_tmp" bs=1 skip=1064 count=4 2>/dev/null | od -A n -t u1 | awk '{print $1 + $2*256 + $3*65536 + $4*16777216}')
+    rm -f "$gpt_tmp"
+
+    [[ -z "$cfg_start" || -z "$cfg_end" || "$cfg_start" -eq 0 ]] && { warn "Cannot parse config partition geometry"; return 1; }
+    cfg_size=$(( cfg_end - cfg_start + 1 ))
+
+    info "Config partition: start=${cfg_start}, size=${cfg_size} sectors"
+
+    # Extract config partition from image
+    local cfg_img="${TMPDIR}/cfg-chroot.img"
+    if [[ -n "$decompress" ]]; then
+        $decompress "$image" | dd of="$cfg_img" bs=512 skip="$cfg_start" count="$cfg_size" 2>/dev/null
+    else
+        dd if="$image" of="$cfg_img" bs=512 skip="$cfg_start" count="$cfg_size" 2>/dev/null
+    fi
+
+    [[ ! -s "$cfg_img" ]] && { warn "Failed to extract config partition"; return 1; }
+
+    # Mount and copy chroot archive
+    local loop_dev
+    loop_dev=$(losetup --find --show "$cfg_img" 2>/dev/null)
+    [[ -z "$loop_dev" ]] && { warn "Failed to setup loop device"; rm -f "$cfg_img"; return 1; }
+
+    mkdir -p "${TMPDIR}/cfg-mnt"
+    if mount -o ro "$loop_dev" "${TMPDIR}/cfg-mnt" 2>/dev/null; then
+        if [[ -f "${TMPDIR}/cfg-mnt/${chroot_file}" ]]; then
+            cp "${TMPDIR}/cfg-mnt/${chroot_file}" "$dest"
+            ok "Extracted chroot from image config partition"
+        else
+            warn "Chroot archive not found in image config partition"
+        fi
+        umount "${TMPDIR}/cfg-mnt" 2>/dev/null || true
+    else
+        warn "Failed to mount config partition from image"
+    fi
+
+    losetup -d "$loop_dev" 2>/dev/null || true
+    rm -f "$cfg_img"
+    rmdir "${TMPDIR}/cfg-mnt" 2>/dev/null || true
+
+    [[ -f "$dest" ]]
+}
+
+# ============================================================
+# build_chroot_from_system — assemble minimal chroot from running system
+# ============================================================
+build_chroot_from_system() {
+    local chroot_dir="${TMPDIR}/root"
+    mkdir -p "${chroot_dir}"
+
+    local bins=(
+        bash dd xz xzcat cat cp grep sed head tail sort tr od
+        mount umount sync mkdir basename dirname sleep tty
+        lsof pgrep pkill awk cut wc du rm chmod kill echo
+        blockdev blkid sgdisk partprobe losetup reboot systemctl
+    )
+
+    # Copy each binary and its shared library dependencies
+    local bin path
+    for bin in "${bins[@]}"; do
+        path=$(command -v "$bin" 2>/dev/null) || continue
+        [[ ! -f "$path" ]] && continue
+
+        # Copy binary preserving directory structure
+        local dest_dir="${chroot_dir}$(dirname "$path")"
+        mkdir -p "$dest_dir"
+        cp -f "$path" "${chroot_dir}${path}" 2>/dev/null || continue
+
+        # Copy shared libraries
+        ldd "$path" 2>/dev/null | grep -oP '/\S+' | while read -r lib; do
+            [[ ! -f "$lib" ]] && continue
+            local lib_dir="${chroot_dir}$(dirname "$lib")"
+            mkdir -p "$lib_dir"
+            cp -fn "$lib" "${chroot_dir}${lib}" 2>/dev/null || true
+        done
+    done
+
+    # Ensure ld-linux dynamic linker is present
+    local ld
+    for ld in /lib64/ld-linux-x86-64.so.2 /lib/ld-linux-x86-64.so.2; do
+        if [[ -f "$ld" ]]; then
+            mkdir -p "${chroot_dir}$(dirname "$ld")"
+            cp -fn "$ld" "${chroot_dir}${ld}" 2>/dev/null || true
+        fi
+    done
+
+    # Create a marker so build_tmpfs_root knows to skip tar extraction
+    touch "${chroot_dir}/.chroot_built"
+
+    local file_count
+    file_count=$(find "$chroot_dir" -type f | wc -l)
+    ok "Built chroot from system (${file_count} files)"
+}
+
+# ============================================================
 # verify_image — check .iso.xz integrity
 # ============================================================
 verify_image() {
@@ -358,7 +567,7 @@ stop_services() {
             systemctl stop agent 2>/dev/null || true
             pkill -9 Xorg 2>/dev/null || true
             ;;
-        osdog-v1)
+        osdog-v2)
             for svc in mining wd wd-load wd-kern wd-la wd-temp dogx af mb-af remotessh; do
                 systemctl stop "$svc" 2>/dev/null || true
             done
@@ -422,62 +631,16 @@ stop_services() {
         systemctl stop "$svc" 2>/dev/null || true
     done < <(systemctl list-units --type=service --state=running --no-legend 2>/dev/null | awk '{print $1}')
 
-    # Kill remaining processes holding root FS
+    # Kill processes holding real open files on root FS.
+    # Filter out mem/txt/rtd/cwd — these are just binaries, libraries,
+    # and working dirs; killing those would take down sshd, dbus, etc.
     local attempt
     for attempt in 1 2 3; do
         while IFS= read -r pid; do
             [[ -z "$pid" || "$pid" == "$$" ]] && continue
             kill -9 "$pid" 2>/dev/null || true
-        done < <(lsof / 2>/dev/null | grep -vP "COMMAND|$SCRIPT_NAME|ssh|sshd|network" | awk '{print $2}' | sort -u)
+        done < <(lsof / 2>/dev/null | grep -vP "COMMAND|$SCRIPT_NAME| (mem|txt|rtd|cwd) |ssh|sshd|network" | awk '{print $2}' | sort -u)
         sleep 1
-    done
-}
-
-# ============================================================
-# copy_with_libs — copy binary + its shared library deps
-# ============================================================
-copy_with_libs() {
-    local src="$1"
-    [[ ! -f "$src" ]] && return
-
-    # Resolve symlinks so we copy the real binary
-    local real_src
-    real_src=$(readlink -f "$src")
-
-    # Copy to both the original path and the resolved path
-    local dest="${TMPDIR}/root${src}"
-    local real_dest="${TMPDIR}/root${real_src}"
-
-    # Copy real binary
-    if [[ ! -f "$real_dest" ]]; then
-        mkdir -p "$(dirname "$real_dest")"
-        cp "$real_src" "$real_dest" 2>/dev/null || return
-    fi
-
-    # Symlink if paths differ
-    if [[ "$src" != "$real_src" && ! -e "$dest" ]]; then
-        mkdir -p "$(dirname "$dest")"
-        ln -sf "$real_src" "$dest" 2>/dev/null || true
-    fi
-
-    # Copy shared libraries
-    local libs
-    libs=$(ldd "$real_src" 2>/dev/null | grep -oP '/\S+' || true)
-    for lib in $libs; do
-        local lib_dest="${TMPDIR}/root${lib}"
-        [[ -f "$lib_dest" ]] && continue
-        mkdir -p "$(dirname "$lib_dest")"
-        cp -a "$lib" "$lib_dest" 2>/dev/null || true
-        # Follow symlinks
-        if [[ -L "$lib" ]]; then
-            local target
-            target=$(readlink -f "$lib")
-            local target_dest="${TMPDIR}/root${target}"
-            if [[ ! -f "$target_dest" && -f "$target" ]]; then
-                mkdir -p "$(dirname "$target_dest")"
-                cp -a "$target" "$target_dest" 2>/dev/null || true
-            fi
-        fi
     done
 }
 
@@ -488,40 +651,14 @@ build_tmpfs_root() {
     info "Building temporary root filesystem in RAM..."
 
     local chroot_dir="${TMPDIR}/root"
-    mkdir -p "${chroot_dir}"/{proc,sys,dev,tmp,etc,usr/bin,usr/lib,usr/sbin}
-    ln -sf usr/bin  "${chroot_dir}/bin"
-    ln -sf usr/sbin "${chroot_dir}/sbin"
-    ln -sf usr/lib  "${chroot_dir}/lib"
-    mkdir -p "${chroot_dir}/usr/lib64"
-    ln -sf usr/lib64 "${chroot_dir}/lib64"
+    mkdir -p "${chroot_dir}"
 
-    # Binaries needed in chroot
-    local bins=(
-        bash sh dd cat mount umount sync sleep tee mkdir cp
-        sgdisk partprobe blkid losetup blockdev
-        lsof kill pkill tty pstree
-        grep sed awk head tail basename dirname tr
-        echo printf reboot
-    )
-
-    # Add xzcat or xz
-    if command -v xzcat &>/dev/null; then
-        bins+=(xzcat)
-    else
-        bins+=(xz)
+    # Extract pre-built chroot archive, unless already built from system
+    if [[ ! -f "${chroot_dir}/.chroot_built" ]]; then
+        tar xf "${TMPDIR}/netdd-chroot.tar.xz" -C "${chroot_dir}/"
     fi
 
-    # Copy each binary and its shared library dependencies
-    for bin_name in "${bins[@]}"; do
-        local bin_path
-        bin_path=$(command -v "$bin_name" 2>/dev/null) || continue
-        copy_with_libs "$bin_path"
-    done
-
-    # Essential config files
-    cp -a /etc/ld.so.cache "${chroot_dir}/etc/" 2>/dev/null || true
-    cp -a /etc/ld.so.conf* "${chroot_dir}/etc/" 2>/dev/null || true
-    cp -a /etc/nsswitch.conf "${chroot_dir}/etc/" 2>/dev/null || true
+    mkdir -p "${chroot_dir}"/{proc,sys,dev,tmp,oldroot,var,run}
 
     # Bind mounts
     mount --bind /proc "${chroot_dir}/proc"
@@ -542,8 +679,33 @@ DISK_NAME=${DISK_NAME}
 IMAGE_FILE=$(basename "$IMAGE_FILE")
 CONF
 
-    # Remount root filesystems read-only (ref: mmp_rewrite.sh — double remount + sysrq)
+    # Save caller's tty so Phase 2 output is visible over SSH
+    local caller_tty
+    caller_tty=$(tty 2>/dev/null) || true
+    if [[ -n "$caller_tty" && -w "$caller_tty" ]]; then
+        echo "$caller_tty" > "${chroot_dir}/caller_tty"
+    fi
+
+    # Redirect output to console + tmpfs log BEFORE remounting root RO.
+    # On systems where /tmp is on root FS (not tmpfs), remount RO would
+    # make stdout writes fail, and set -e would kill the script.
     info "Remounting filesystems read-only..."
+
+    # Find writable console for output after SSH dies
+    local console=""
+    for c in /dev/console /dev/tty1; do
+        [[ -w "$c" ]] && { console="$c"; break; }
+    done
+    # Redirect: log to tmpfs, and also to console if available
+    if [[ -n "$console" ]]; then
+        exec > "$console" 2>&1
+    else
+        exec > "${chroot_dir}/phase1.log" 2>&1
+    fi
+
+    echo "[netdd] Remounting filesystems read-only..."
+
+    # Remount root filesystems read-only (ref: mmp_rewrite.sh — double remount + sysrq)
     while IFS= read -r mnt; do
         mount -n -o remount,ro "$mnt" 2>/dev/null || true
     done < <(mount | grep "/dev/${DISK_NAME}" | awk '{print $3}' | sort -r)
@@ -560,17 +722,11 @@ CONF
 
     sync
 
-    # Save caller's tty so Phase 2 output is visible over SSH
-    local caller_tty
-    caller_tty=$(tty 2>/dev/null) || true
-    if [[ -n "$caller_tty" && -w "$caller_tty" ]]; then
-        echo "$caller_tty" > "${chroot_dir}/caller_tty"
-    fi
-
-    # Chroot and re-exec this script
-    info "Entering tmpfs chroot..."
+    # Chroot and re-exec this script.
+    echo "[netdd] Entering tmpfs chroot..."
     local bash_path
     bash_path=$(command -v bash)
+    echo "[netdd] exec chroot ${chroot_dir} ${bash_path} /${SCRIPT_NAME}"
     exec chroot "${chroot_dir}" "${bash_path}" "/${SCRIPT_NAME}"
 }
 
@@ -582,11 +738,6 @@ write_image() {
     info "Writing OS.Dog v3 to ${BOLD}/dev/${DISK_NAME}${NC}..."
     warn "Do NOT power off until this completes!"
     echo ""
-
-    # Drop kernel caches and flush block device buffers to prevent
-    # stale cached data from being written back over the new image
-    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-    blockdev --flushbufs "/dev/${DISK_NAME}" 2>/dev/null || true
 
     local exitcode=0
     if command -v xzcat &>/dev/null; then
@@ -616,13 +767,17 @@ write_image() {
 
     [[ $exitcode -ne 0 ]] && die "Image write failed (exit code: $exitcode)"
 
-    sync
+    # Do NOT use 'sync' here — it would flush stale ext4 metadata from the old
+    # filesystem's buffer cache (/dev/sdXN), overwriting our freshly written data.
+    # With oflag=direct, dd writes bypass page cache and go directly to disk.
+    # Just flush the whole-disk block device to ensure all writes are committed.
+    blockdev --flushbufs "/dev/${DISK_NAME}" 2>/dev/null || true
+
     ok "Image written successfully"
 }
 
 fix_gpt() {
     info "Fixing GPT partition table..."
-    # Unmount stale partitions so kernel can re-read the table
     umount -f /dev/${DISK_NAME}?* 2>/dev/null || true
     umount -f /dev/${DISK_NAME}p?* 2>/dev/null || true
 
@@ -642,6 +797,10 @@ prepare_config() {
 
     info "Preparing config from image archive..."
 
+    # Disable strict mode — this function is best-effort,
+    # failures should not kill the whole script
+    set +eo pipefail
+
     # Determine decompression command
     local decompress=""
     if [[ "$IMAGE_FILE" == *.xz ]]; then
@@ -652,30 +811,38 @@ prepare_config() {
         fi
     fi
 
-    # Extract GPT header from image (first 2 MB is plenty)
-    # || true: xzcat gets SIGPIPE when dd closes the pipe early, which is expected
+    # Extract GPT header from image (first 34 sectors = 17 KB is enough)
     if [[ -n "$decompress" ]]; then
-        $decompress "/${IMAGE_FILE}" | dd of=/tmp/gpt.img bs=1M count=2 2>/dev/null || true
+        $decompress "/${IMAGE_FILE}" | dd of=/tmp/gpt.img bs=512 count=34 2>/dev/null
     else
-        dd if="/${IMAGE_FILE}" of=/tmp/gpt.img bs=1M count=2 2>/dev/null
+        dd if="/${IMAGE_FILE}" of=/tmp/gpt.img bs=512 count=34 2>/dev/null
     fi
 
-    # Read partition 1 geometry from GPT
-    CFG_START_SECTOR=$(sgdisk -i 1 /tmp/gpt.img 2>/dev/null | grep "First sector" | awk '{print $3}')
-    CFG_SIZE_SECTORS=$(sgdisk -i 1 /tmp/gpt.img 2>/dev/null | grep "Partition size" | awk '{print $3}')
+    # Parse GPT partition entry 1 directly (no sgdisk — it chokes on truncated files)
+    # GPT layout: LBA 0 = protective MBR, LBA 1 = header, LBA 2-33 = partition entries
+    # Each entry is 128 bytes. Partition 1 is at byte offset 1024.
+    # Starting LBA: bytes 32-39 of entry (absolute offset 1056), little-endian uint64
+    # Ending LBA:   bytes 40-47 of entry (absolute offset 1064), little-endian uint64
+    # We read 4 bytes (uint32) — enough for disks up to 2 TB
+    read_le32() {
+        dd if="$1" bs=1 skip="$2" count=4 2>/dev/null | od -A n -t u1 | awk '{print $1 + $2*256 + $3*65536 + $4*16777216}'
+    }
 
-    rm -f /tmp/gpt.img
+    CFG_START_SECTOR=$(read_le32 /tmp/gpt.img 1056)
+    local cfg_end_sector
+    cfg_end_sector=$(read_le32 /tmp/gpt.img 1064)
 
-    if [[ -z "$CFG_START_SECTOR" || -z "$CFG_SIZE_SECTORS" ]]; then
+    if [[ -z "$CFG_START_SECTOR" || -z "$cfg_end_sector" || "$CFG_START_SECTOR" -eq 0 ]]; then
         warn "Cannot read partition 1 geometry from image GPT"
+        set -eo pipefail
         return
     fi
+    CFG_SIZE_SECTORS=$(( cfg_end_sector - CFG_START_SECTOR + 1 ))
     info "Config partition: start=${CFG_START_SECTOR}, size=${CFG_SIZE_SECTORS} sectors"
 
     # Extract config partition from archive into a file
-    # || true: same SIGPIPE reason as above
     if [[ -n "$decompress" ]]; then
-        $decompress "/${IMAGE_FILE}" | dd of=/tmp/cfg.img bs=512 skip="$CFG_START_SECTOR" count="$CFG_SIZE_SECTORS" 2>/dev/null || true
+        $decompress "/${IMAGE_FILE}" | dd of=/tmp/cfg.img bs=512 skip="$CFG_START_SECTOR" count="$CFG_SIZE_SECTORS" 2>/dev/null
     else
         dd if="/${IMAGE_FILE}" of=/tmp/cfg.img bs=512 skip="$CFG_START_SECTOR" count="$CFG_SIZE_SECTORS" 2>/dev/null
     fi
@@ -683,6 +850,7 @@ prepare_config() {
     if [[ ! -s /tmp/cfg.img ]]; then
         warn "Failed to extract config partition from image"
         CFG_START_SECTOR=""
+        set -eo pipefail
         return
     fi
 
@@ -692,6 +860,7 @@ prepare_config() {
     if [[ -z "$loop_dev" ]]; then
         warn "Failed to setup loop device"
         CFG_START_SECTOR=""
+        set -eo pipefail
         return
     fi
 
@@ -707,6 +876,9 @@ prepare_config() {
     fi
 
     losetup -d "$loop_dev" 2>/dev/null || true
+
+    # Restore strict mode
+    set -eo pipefail
 }
 
 write_config_to_disk() {
@@ -714,7 +886,7 @@ write_config_to_disk() {
 
     info "Writing config partition to disk..."
     dd if=/tmp/cfg.img of="/dev/${DISK_NAME}" bs=512 seek="$CFG_START_SECTOR" count="$CFG_SIZE_SECTORS" conv=notrunc oflag=direct 2>/dev/null
-    sync
+    blockdev --flushbufs "/dev/${DISK_NAME}" 2>/dev/null || true
 
     echo ""
     echo -e "${CYAN}Applied configuration:${NC}"
@@ -732,6 +904,11 @@ reboot_system() {
     info "Rebooting in 10 seconds... (Ctrl+C to cancel)"
 
     sleep 10
+
+    # Do NOT use 'sync' — it would flush stale ext4 metadata from old filesystem
+    # buffer cache, potentially overwriting freshly written image data.
+    # All dd writes use oflag=direct, so data is already on disk.
+    sleep 2
 
     # sysrq is the most reliable from chroot
     echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
@@ -778,6 +955,7 @@ phase1_prepare() {
 
     preserve_config
     download_image
+    download_chroot
     verify_image
     stop_services
     build_tmpfs_root
@@ -785,13 +963,24 @@ phase1_prepare() {
 }
 
 phase2_write() {
-    # Restore output to caller's tty (SSH session)
-    if [[ -f /caller_tty ]]; then
-        local tty
-        tty=$(cat /caller_tty)
-        if [[ -w "$tty" ]]; then
-            exec > >(tee "$tty") 2>&1
+    # Phase 2 runs inside tmpfs chroot. SSH may die at any point
+    # (sshd killed, disk overwritten, etc). We MUST reach reboot no matter what.
+    # Disable set -e: any failed write to a dead tty would kill the script.
+    # Old dog/netdd and hive-replace never used set -e — and they work reliably.
+    set +euo pipefail
+
+    # Send output to the physical console so the user can see progress on the monitor.
+    # Try /dev/console first, fall back to /dev/tty1.
+    local console=""
+    for c in /dev/console /dev/tty1; do
+        if [[ -w "$c" ]]; then
+            console="$c"
+            break
         fi
+    done
+
+    if [[ -n "$console" ]]; then
+        exec > "$console" 2>&1
     fi
 
     echo ""
@@ -801,6 +990,18 @@ phase2_write() {
     # Extract config partition from archive BEFORE writing image to disk.
     # After write_image the disk should never be read back (kernel cache issues).
     prepare_config
+
+    # Flush and invalidate all block device caches before dd to prevent
+    # stale partition metadata from overwriting freshly written image data.
+    sync
+    for part in /dev/${DISK_NAME}?* /dev/${DISK_NAME}; do
+        blockdev --flushbufs "$part" 2>/dev/null || true
+    done
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    # Wipe partition table from kernel's perspective so it stops tracking partitions
+    # This prevents kernel from writing back stale metadata after dd
+    dd if=/dev/zero of="/dev/${DISK_NAME}" bs=512 count=34 oflag=direct 2>/dev/null || true
+    sleep 1
 
     write_image
     fix_gpt
