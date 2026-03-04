@@ -5,8 +5,8 @@
 # ============================================================
 
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:$PATH
-SCRIPT_PATH=$(cd "$(dirname "$0")" && pwd)
-SCRIPT_NAME=$(basename "$0")
+SCRIPT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)
+SCRIPT_NAME=$(basename "${BASH_SOURCE[0]:-$0}")
 TMPDIR="/tmp/osdog"
 
 # ---- Colors ----
