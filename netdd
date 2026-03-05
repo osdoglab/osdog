@@ -5,8 +5,8 @@
 # ============================================================
 
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:$PATH
-SCRIPT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)
-SCRIPT_NAME=$(basename "${BASH_SOURCE[0]:-$0}")
+SCRIPT_PATH=$(cd "$(dirname "$0")" 2>/dev/null && pwd || pwd)
+SCRIPT_NAME=$(basename "$0")
 TMPDIR="/tmp/osdog"
 
 # ---- Colors ----
@@ -262,8 +262,20 @@ prepare() {
         # Traditional: copy real dirs
         cp -aR /bin "$R/" 2>/dev/null || true
         cp -aR /sbin "$R/" 2>/dev/null || true
+        mkdir -p "$R/lib"
         cp -aR /lib/x86_64-linux-gnu "$R/lib/" 2>/dev/null || true
         cp -aR /lib64 "$R/" 2>/dev/null || true
+    fi
+
+    # Verify essential binaries got copied
+    local missing=()
+    for f in "$R/bin/bash" "$R/bin/dd"; do
+        [[ -f "$f" ]] || missing+=("$f")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "Failed to copy binaries to chroot: ${missing[*]}
+  df tmpfs: $(df -h "$TMPDIR" 2>&1)
+  Check RAM: tmpfs may be full."
     fi
 
     mount --bind /proc "$R/proc"
@@ -283,11 +295,24 @@ IMAGE_FILE=${filename}
 CONF
 
     ok "Chroot ready"
+
+    # Preflight: verify chroot actually works before exec'ing into it.
+    # "No such file or directory" from chroot usually means the dynamic
+    # linker (ld-linux) or a library is missing, not bash itself.
+    if ! chroot "$R" /bin/bash -c 'echo ok' &>/dev/null; then
+        echo ""
+        die "Chroot preflight failed. Diagnostics:
+  bash:      $(ls -la "$R/bin/bash" 2>&1)
+  ld-linux:  $(ls -la "$R/lib64/ld-linux-x86-64.so.2" 2>&1)
+  ldd bash:  $(chroot "$R" ldd /bin/bash 2>&1 || true)
+  df tmpfs:  $(df -h "$TMPDIR" 2>&1)"
+    fi
+
     info "Entering chroot..."
 
     sync
     cd "$R"
-    exec chroot . /bin/bash "/$SCRIPT_NAME"
+    exec setsid chroot . /bin/bash "/$SCRIPT_NAME"
 }
 
 # ============================================================
@@ -305,16 +330,74 @@ write() {
     echo "========================================"
     echo ""
 
-    # Unmount old partitions (still mounted RO from live system)
+    # Prepare config partition image BEFORE sysrq-u.
+    # Extract config partition from downloaded image, write agent.yaml via mcopy or loop mount.
+    local cfg_ready=""
+    local cfg_img="/tmp/cfg.img"
+    if [[ -d /saved-config ]]; then
+        echo "[netdd] Preparing config..."
+        # Extract config partition from image (partition 1: sector 2048, 45056 sectors)
+        if [[ "$IMAGE_FILE" == *.xz ]]; then
+            xzcat "/${IMAGE_FILE}" | dd bs=512 skip=2048 count=45056 of="$cfg_img" 2>/dev/null
+        else
+            dd if="/${IMAGE_FILE}" bs=512 skip=2048 count=45056 of="$cfg_img" 2>/dev/null
+        fi
+
+        if command -v mcopy &>/dev/null; then
+            # mtools: write directly to FAT image without mounting
+            mcopy -o -i "$cfg_img" /saved-config/agent.yaml ::agent.yaml 2>/dev/null && cfg_ready=1
+        fi
+        if [[ -z "$cfg_ready" ]]; then
+            # Fallback: loop mount
+            mkdir -p /tmp/cfg
+            if mount -o loop "$cfg_img" /tmp/cfg 2>/dev/null; then
+                cp /saved-config/agent.yaml /tmp/cfg/agent.yaml 2>/dev/null && cfg_ready=1
+                umount /tmp/cfg 2>/dev/null || true
+            else
+                echo "[netdd] WARNING: cannot mount config image (loop)"
+            fi
+        fi
+
+        if [[ "$cfg_ready" == "1" ]]; then
+            echo "[netdd] Config:"
+            cat /saved-config/agent.yaml 2>/dev/null
+            echo "[netdd] Config image prepared"
+        fi
+    fi
+
+    # Nuclear flush: guarantee no dirty pages survive before dd.
+    # Problem: ext4 journal thread (jbd2) keeps creating dirty pages in
+    # partition device caches even after umount attempts from chroot.
+    # If those stale dirty pages get flushed during/after dd (via memory
+    # pressure or writeback), they overwrite freshly written image data.
+    # Solution: sysrq-s syncs all filesystems, sysrq-u force-remounts
+    # everything read-only (stops jbd2), then flush buffer caches.
+    echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
+    echo s > /proc/sysrq-trigger 2>/dev/null || true
+    sleep 1
+    echo u > /proc/sysrq-trigger 2>/dev/null || true
+    sleep 1
+
     for p in /dev/${DISK_NAME}[0-9]*; do
         umount "$p" 2>/dev/null || true
     done
+    sync
+    blockdev --flushbufs "/dev/${DISK_NAME}" 2>/dev/null || true
+    for p in /dev/${DISK_NAME}[0-9]*; do
+        blockdev --flushbufs "$p" 2>/dev/null || true
+    done
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
 
-    # Write image
+    # Disable kernel writeback daemon to prevent it from flushing any
+    # dirty pages that might appear during dd (from partition device caches).
+    echo 0 > /proc/sys/vm/dirty_writeback_centisecs 2>/dev/null || true
+    echo 99999999 > /proc/sys/vm/dirty_expire_centisecs 2>/dev/null || true
+
+    # Write image (oflag=direct bypasses page cache entirely)
     if [[ "$IMAGE_FILE" == *.xz ]]; then
-        xzcat "/${IMAGE_FILE}" | dd of="/dev/${DISK_NAME}" bs=4M status=progress
+        xzcat "/${IMAGE_FILE}" | dd of="/dev/${DISK_NAME}" bs=4M oflag=direct status=progress
     else
-        dd if="/${IMAGE_FILE}" of="/dev/${DISK_NAME}" bs=4M status=progress
+        dd if="/${IMAGE_FILE}" of="/dev/${DISK_NAME}" bs=4M oflag=direct status=progress
     fi
 
     echo ""
@@ -338,40 +421,48 @@ write() {
     partprobe "/dev/${DISK_NAME}" > /dev/null 2>&1
     sleep 3
 
-    # Write config to partition 1
+    # Fix stale superblock in partition page cache.
+    # ext4 keeps superblock buffer referenced in /dev/sdXN page cache — drop_caches
+    # can't free it. After dd to whole-disk via O_DIRECT, partition caches still have
+    # old (pre-dd) superblock. Fix: read correct data from whole-disk (O_DIRECT) and
+    # write directly to partition device (O_DIRECT), bypassing page cache entirely.
+    # Do NOT use blockdev --flushbufs on partitions — it would flush ALL stale dirty
+    # pages (including journal blocks from old OS), corrupting the new image.
+    echo "[netdd] Fixing partition superblocks..."
+    for part_dev in /dev/${DISK_NAME}[0-9]* /dev/${DISK_NAME}p[0-9]*; do
+        [[ -b "$part_dev" ]] || continue
+        local bname="${part_dev#/dev/}"
+        local start_file="/sys/class/block/${bname}/start"
+        [[ -r "$start_file" ]] || continue
+        local start_sect
+        start_sect=$(cat "$start_file")
+        # Read first 4K from whole-disk at partition offset, write to partition device.
+        # Both use O_DIRECT — data goes disk→disk, no page cache interaction.
+        dd if="/dev/${DISK_NAME}" of="${part_dev}" \
+            bs=4096 count=1 skip=$((start_sect / 8)) \
+            iflag=direct oflag=direct 2>/dev/null || true
+    done
+
+    # Write prepared config partition to disk
     local cfg_part
     cfg_part=$(disk_part "$DISK_NAME" 1)
-    if [[ -d /saved-config && -b "/dev/${cfg_part}" ]]; then
+    if [[ "$cfg_ready" == "1" && -f "$cfg_img" && -b "/dev/${cfg_part}" ]]; then
         echo "[netdd] Writing config to /dev/${cfg_part}..."
-
-        # Read config partition from freshly written image, write config, dd back
-        # (avoids mount issues — kernel may refuse mount after dd)
-        local cfg_img="/tmp/cfg.img"
-        local cfg_size
-        cfg_size=$(blockdev --getsize64 "/dev/${cfg_part}" 2>/dev/null || echo 23068672)
-        dd if="/dev/${cfg_part}" of="$cfg_img" bs=1M 2>/dev/null
-
-        mkdir -p /tmp/cfg
-        if mount -o loop "$cfg_img" /tmp/cfg 2>/dev/null; then
-            cp /saved-config/agent.yaml /tmp/cfg/agent.yaml 2>/dev/null
-            echo "[netdd] Config:"
-            cat /saved-config/agent.yaml 2>/dev/null
-            umount /tmp/cfg 2>/dev/null || true
-            dd if="$cfg_img" of="/dev/${cfg_part}" bs=1M 2>/dev/null
-            echo "[netdd] Config written OK"
-        else
-            echo "[netdd] WARNING: cannot mount config image (loop)"
-            echo "[netdd] mount error: $(mount -o loop "$cfg_img" /tmp/cfg 2>&1)"
-        fi
-        rm -f "$cfg_img"
+        dd if="$cfg_img" of="/dev/${cfg_part}" bs=1M oflag=direct 2>/dev/null
+        echo "[netdd] Config written OK"
     fi
+    rm -f "$cfg_img" 2>/dev/null
 
     # Reboot
     echo ""
     echo "[netdd] Install complete!"
     echo "[netdd] Rebooting in 15 seconds..."
 
-    sync
+    # Only flush whole-disk device (for sgdisk GPT fix).
+    # Do NOT flush partition devices — they may have stale dirty pages from
+    # ext4 journal that would overwrite dd's data. Config partition was already
+    # flushed after config write. Stale pages will be lost on sysrq-b reboot.
+    blockdev --flushbufs "/dev/${DISK_NAME}" 2>/dev/null || true
     sleep 15
 
     echo 1 > /proc/sys/kernel/sysrq
