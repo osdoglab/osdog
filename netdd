@@ -158,16 +158,22 @@ stop_services() {
         systemctl stop "$svc" > /dev/null 2>&1
     done
 
-    # Kill processes with open files on root
-    local pid="1"
-    while [[ -n "$pid" ]]; do
-        pid=$(lsof / 2>/dev/null | grep -v ' \(mem\|txt\|rtd\|cwd\) ' | grep -v "$SCRIPT_NAME" | sed '2!d' | awk '{print $2}')
-        [[ -z "$pid" ]] && continue
+    # Kill remaining non-essential processes.
+    # Build full ancestor chain ($$→PPID→...→1) to avoid killing our own tree.
+    local -A skip_pids=()
+    local p=$$
+    while [[ $p -gt 1 ]]; do
+        skip_pids[$p]=1
+        p=$(awk '{print $4}' /proc/$p/stat 2>/dev/null) || break
+    done
+    for pid in $(ps -eo pid= 2>/dev/null); do
+        pid=$((pid))
+        [[ $pid -le 2 || -n "${skip_pids[$pid]:-}" ]] && continue
+        [[ -z "$(cat /proc/$pid/cmdline 2>/dev/null)" ]] && continue  # kernel thread
         local pname
-        pname=$(lsof / 2>/dev/null | grep -v ' \(mem\|txt\|rtd\|cwd\) ' | grep -v "$SCRIPT_NAME" | sed '2!d' | awk '{print $1}')
-        echo "  Kill $pname ($pid)"
-        kill "$pid" 2>/dev/null || true
-        sleep 1
+        pname=$(cat /proc/$pid/comm 2>/dev/null || echo "")
+        [[ "$pname" == sshd* || "$pname" == *ssh* ]] && continue
+        kill -9 "$pid" 2>/dev/null || true
     done
 }
 
@@ -197,9 +203,12 @@ prepare() {
         [[ "$answer" != "yes" ]] && die "Aborted"
     fi
 
-    # Tmpfs
+    # Tmpfs — use 80% of total RAM (need space for image + chroot with all libs)
+    local tmpfs_mb=$(( mem * 80 / 100 ))
+    [[ $tmpfs_mb -lt 2500 ]] && tmpfs_mb=2500
     mkdir -p "$TMPDIR"
-    mount -t tmpfs -o size=3500m none "$TMPDIR"
+    mount -t tmpfs -o size=${tmpfs_mb}m none "$TMPDIR"
+    info "Tmpfs: ${tmpfs_mb} MB"
 
     # Preserve config
     preserve_config
@@ -243,10 +252,16 @@ prepare() {
     local R="$TMPDIR/root"
     mkdir -p "$R"/{proc,sys,run,dev,tmp,oldroot,usr/bin,usr/sbin,usr/lib,usr/share}
 
-    # Copy actual directories (Ubuntu 24.04: /bin→/usr/bin, /lib→/usr/lib)
+    # Copy system directories. Skip NVIDIA/GPU libs (~500MB+) — not needed for dd/reboot.
     cp -aR /usr/bin "$R/usr/" 2>/dev/null || true
     cp -aR /usr/sbin "$R/usr/" 2>/dev/null || true
-    cp -aR /usr/lib/x86_64-linux-gnu "$R/usr/lib/" 2>/dev/null || true
+    mkdir -p "$R/usr/lib/x86_64-linux-gnu"
+    # Copy shared libs + symlinks, skip huge subdirs (dri, nvidia, mesa, etc.)
+    find /usr/lib/x86_64-linux-gnu -maxdepth 1 \( -type f -o -type l \) -name '*.so*' \
+        -exec cp -a {} "$R/usr/lib/x86_64-linux-gnu/" \; 2>/dev/null || true
+    for d in /usr/lib/x86_64-linux-gnu/{ld-linux*,gconv,libnss*}; do
+        [[ -e "$d" ]] && cp -aR "$d" "$R/usr/lib/x86_64-linux-gnu/" 2>/dev/null || true
+    done
     cp -aR /usr/lib/sudo "$R/usr/lib/" 2>/dev/null || true
     cp -aR /etc "$R/" 2>/dev/null || true
 
@@ -262,8 +277,12 @@ prepare() {
         # Traditional: copy real dirs
         cp -aR /bin "$R/" 2>/dev/null || true
         cp -aR /sbin "$R/" 2>/dev/null || true
-        mkdir -p "$R/lib"
-        cp -aR /lib/x86_64-linux-gnu "$R/lib/" 2>/dev/null || true
+        mkdir -p "$R/lib/x86_64-linux-gnu"
+        find /lib/x86_64-linux-gnu -maxdepth 1 \( -type f -o -type l \) -name '*.so*' \
+            -exec cp -a {} "$R/lib/x86_64-linux-gnu/" \; 2>/dev/null || true
+        for d in /lib/x86_64-linux-gnu/{ld-linux*,gconv,libnss*}; do
+            [[ -e "$d" ]] && cp -aR "$d" "$R/lib/x86_64-linux-gnu/" 2>/dev/null || true
+        done
         cp -aR /lib64 "$R/" 2>/dev/null || true
     fi
 
