@@ -1,0 +1,8 @@
+Package: osdog-tools
+Version: 1.0.0
+Architecture: amd64
+Maintainer: osdoglab <osdoglab@users.noreply.github.com>
+Section: admin
+Priority: optional
+Description: OS.Dog system tools
+ napalm13 (NVIDIA GPU overclocking/monitoring) and autofancore (fan control).
